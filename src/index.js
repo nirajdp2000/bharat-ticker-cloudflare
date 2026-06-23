@@ -116,23 +116,19 @@ function ttToQuote(sym, r, open) {
   for (const k of Object.keys(q)) if (q[k] === undefined) delete q[k];
   return q;
 }
-// Session open = first intraday tick; fixed once set at 09:15, so cache per
-// (symbol, IST-day) — a quote sweep costs ~0 extra after the first fill.
+// Session open = first intraday tick. NO Cache API here: match+put would be 2
+// extra subrequests PER SYMBOL (they share the 50/invocation cap with fetch), and
+// for a 30-symbol batch that alone is ~50 ops → cap blown. Instead the open is a
+// plain budgeted fetch; the router-level full-response cache (5s) shields repeats.
+// `budget.n` (set from remaining headroom by the caller) hard-caps how many cold
+// opens fire — check+decrement are synchronous so exactly `budget.n` get through.
 async function openForSymbol(sid, ctx, budget) {
-  const key = new Request(`https://edge.open/${istDate()}/${encodeURIComponent(sid)}`);
-  const hit = await caches.default.match(key);
-  if (hit) { const v = Number(await hit.text()); return v > 0 ? v : null; }   // cache hit = free, never counts
-  // A cold miss = a real upstream fetch (counts toward the 50-subreq/invocation cap).
-  // Honor the shared per-invocation budget so a big COLD batch can't blow the limit;
-  // budget-exhausted symbols ship without `open` and fill in once the edge cache warms.
-  // (check + decrement are synchronous → exactly `budget.n` misses get through.)
   if (budget) { if (budget.n <= 0) return null; budget.n--; }
   const j = await ttGet(`/stocks/charts/inter/${encodeURIComponent(sid)}`, `?duration=1d`);
   const pts = j?.data?.[0]?.points || [];
   const today = istDate();
   const first = pts.find((p) => String(p.ts).slice(0, 10) === today) || pts[0];
   const open = first ? num(first.lp) : 0;
-  if (open > 0) ctx.waitUntil(caches.default.put(key, new Response(String(open), { headers: { "cache-control": "public, max-age=28800" } })));
   return open > 0 ? open : null;
 }
 async function handleQuotes(url, ctx) {
@@ -154,14 +150,15 @@ async function handleQuotes(url, ctx) {
   if (!sidMap.size) return json({ quotes: [], count: 0, source: "tickertape_realtime_nse" });
   const j = await ttGet("/stocks/quotes", `?sids=${[...sidMap.values()].join(",")}`);
   const bySid = new Map((j?.data || []).map((r) => [r.sid, r]));
-  // HARD subrequest ceiling. Per invocation the only upstream fetches are:
-  //   ≤26 letterList (one per A–Z, memoized) + 1 quotes batch + 1 per COLD-MISS
-  //   open-backfill. A non-fast 30-symbol batch with a cold cache spanning many
-  //   distinct letters could otherwise reach 26 + 1 + 30 = 57 > 50 (free-tier cap).
-  //   A shared budget caps the cold open-fetches so 26 + 20 + 1 = 47 < 50 holds in
-  //   EVERY state. Warm symbols (open already cached) are served free and unbounded;
-  //   only cold misses spend budget, and any skipped symbol just ships without `open`.
-  const openBudget = { n: 20 };
+  // HARD subrequest ceiling (cap = 50/invocation, free tier; fetch AND Cache API
+  // share it). Per invocation the ONLY subrequests are: `L` letterList fetches
+  // (L = distinct first-letters, ≤26, in-memory-memoized — no Cache API) + 1
+  // quotes batch + 1 per open-backfill fetch + the router's 2 response-cache ops.
+  // Size the open budget from the REMAINING headroom so the worst case is bounded
+  // regardless of how many letters the batch spans: L + 1 + opens + 2 ≤ ~43 < 50.
+  // fast=true skips opens entirely. Symbols past the budget just ship without
+  // `open` (it's optional); the 5s response cache shields repeat polls.
+  const openBudget = { n: fast ? 0 : Math.max(0, 40 - letterMemo.size) };
   const quotes = (await Promise.all([...sidMap.entries()].map(async ([sym, sid]) => {
     const r = bySid.get(sid); if (!r) return null;
     const open = fast ? null : await openForSymbol(sid, ctx, openBudget).catch(() => null);
@@ -170,21 +167,21 @@ async function handleQuotes(url, ctx) {
   return json({ quotes, count: quotes.length, source: "tickertape_realtime_nse", asOf: new Date().toISOString() });
 }
 
-// ── sid resolution (Tickertape universe, cached per-letter) ──────────────────
+// ── sid resolution (Tickertape universe) ─────────────────────────────────────
+// IMPORTANT: Cache API match/put EACH count against the 50-subrequest/invocation
+// free-tier cap (same quota as fetch). A per-letter cache (match+fetch+put = 3
+// ops/letter) on a many-letter batch blew the cap. So NO per-letter Cache API —
+// dedupe only with the per-invocation in-memory `memo` (Map ops are free), and
+// let the router-level full-response cache absorb cross-invocation repeats. Cost:
+// one /stocks/list fetch per DISTINCT first-letter per cold invocation (≤26).
 async function letterList(letter, ctx, memo) {
   letter = letter.toLowerCase();
-  // Dedupe concurrent + repeat lookups of the same letter within one invocation:
-  // return the in-flight promise so N symbols on letter "w" share ONE upstream fetch.
+  // Share the in-flight promise so N symbols on the same letter = ONE fetch.
   if (memo && memo.has(letter)) return memo.get(letter);
   const p = (async () => {
-    const key = new Request(`https://edge.sid/${letter}`);
-    const hit = await caches.default.match(key);
-    if (hit) return hit.json();
     const j = await ttGet("/stocks/list", `?filter=${letter}`);
-    const rows = (j?.data || []).filter((x) => x?.ticker && x?.sid)
+    return (j?.data || []).filter((x) => x?.ticker && x?.sid)
       .map((x) => ({ ticker: String(x.ticker).toUpperCase(), sid: x.sid, name: x.name || x.ticker, isin: x.isin || null }));
-    ctx.waitUntil(caches.default.put(key, new Response(JSON.stringify(rows), { headers: { "cache-control": "public, max-age=86400" } })));
-    return rows;
   })();
   if (memo) memo.set(letter, p);
   return p;
