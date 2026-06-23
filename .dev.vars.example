@@ -1,0 +1,10 @@
+# Copy to .dev.vars for `wrangler dev` (git-ignored). In production use:
+#   wrangler secret put CLIENT_API_KEY
+#   wrangler secret put ORIGIN_API_KEY
+
+# Require callers to send x-api-key: <value>  (or ?key=<value>). Leave unset = open.
+CLIENT_API_KEY=
+
+# Forwarded to the Northflank origin as header x-edge-key. Optional lock so only
+# this Worker can hit origin (origin must check it — currently it does not).
+ORIGIN_API_KEY=

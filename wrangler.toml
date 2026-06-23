@@ -1,0 +1,21 @@
+name = "bharat-ticker-cloudflare"
+main = "src/worker.js"
+compatibility_date = "2025-06-01"
+workers_dev = true
+
+# Edge proxy + cache in front of the Northflank bharat-ticker origin.
+# This Worker does NOT run the app — it proxies to ORIGIN below.
+[vars]
+ORIGIN = "https://p01--bharat-ticker--p99g2z5k7vzw.code.run"
+CORS_ORIGIN = "*"
+
+# --- Secrets (do NOT put in this file). Set with wrangler:
+#   wrangler secret put CLIENT_API_KEY    # require x-api-key on every call
+#   wrangler secret put ORIGIN_API_KEY    # forwarded to origin as x-edge-key
+#
+# Observability (optional)
+[observability]
+enabled = true
+
+[placement]
+mode = "smart"

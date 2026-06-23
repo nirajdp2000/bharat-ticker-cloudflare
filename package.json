@@ -1,0 +1,15 @@
+{
+  "name": "bharat-ticker-cloudflare",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker edge proxy + cache in front of the Northflank bharat-ticker API. Does not host the app.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.103.0"
+  }
+}
