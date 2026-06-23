@@ -11,5 +11,8 @@
   },
   "devDependencies": {
     "wrangler": "^4.103.0"
+  },
+  "dependencies": {
+    "postgres": "^3.4.9"
   }
 }

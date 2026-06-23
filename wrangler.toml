@@ -1,12 +1,28 @@
 name = "bharat-ticker-cloudflare"
 main = "src/index.js"
 compatibility_date = "2025-06-01"
+# nodejs_compat: required by the `postgres` driver used for the Hyperdrive PG path.
+# Harmless when the binding is absent (the import just sits unused).
+compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
-# Native scraper Worker — runs entirely on the FREE Workers plan. No containers,
-# no Durable Objects, no origin. Fetches Groww/Tickertape (real-time) + Yahoo
-# (historical) directly with plain `fetch`. See src/index.js for the latency
-# contract (live = Groww/Tickertape only; Yahoo = historical only).
+# Native scraper Worker — runs on the FREE Workers plan. Fetches Groww/Tickertape
+# (real-time) + Yahoo (historical) directly with plain `fetch`. See src/index.js
+# for the latency contract (live = Groww/Tickertape; Yahoo = historical only).
+
+# ── Hyperdrive → Northflank Postgres (sub-minute 1s store) ───────────────────
+# Gives the edge Worker the real 500ms/1s/10s + deep intraday data from the NF
+# `intraday_candles` table (pooled, query-cached, app-independent). FREE plan:
+# 100k queries/day. INERT until configured — sub-minute requests fall back to the
+# honest empty until then. TO ENABLE (you run; the connection string holds the PG
+# password so do NOT commit it):
+#   1. npx wrangler hyperdrive create bharat-pg \
+#        --connection-string="postgres://USER:PASS@HOST:PORT/DB?sslmode=require"
+#   2. paste the returned id below and uncomment this block
+#   3. npx wrangler deploy
+# [[hyperdrive]]
+# binding = "PG"
+# id = "<paste-hyperdrive-id-here>"
 
 [observability]
 enabled = true

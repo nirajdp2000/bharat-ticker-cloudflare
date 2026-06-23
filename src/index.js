@@ -19,6 +19,8 @@
  * caller's armed cascade fills it — delayed data is never served as live.
  */
 
+import postgres from "postgres";   // only used when the [[hyperdrive]] PG binding is set
+
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -239,11 +241,55 @@ async function ttTodayBars(symbol, bucketMs, ctx) {
 }
 function subMinuteResp(interval, extra = {}) {
   return json({ candles: [], count: 0, interval, note: "sub-minute-unsupported", finest: "1minute",
-    reason: "no sub-minute source on the stateless edge (Tickertape ticks are 60s); use the origin sampler for 1s/10s", ...extra });
+    reason: "no sub-minute source on the stateless edge (Tickertape ticks are 60s); wire the [[hyperdrive]] PG binding or use the localhost sampler for 1s/10s", ...extra });
 }
-async function handleIntraday(url, symbol, ctx) {
+
+// ── Sub-minute via Hyperdrive → Northflank Postgres (the real 1s store) ──────
+// The native scrapers bottom out at 60s. True 500ms/1s/10s data lives in the NF
+// `intraday_candles` table (1s base, 60-day retention). Hyperdrive lets this edge
+// Worker read it directly — pooled + query-cached + APP-INDEPENDENT (works even
+// when the NF app is down; only PG must be up). INERT until the [[hyperdrive]]
+// binding `PG` is configured (env.PG absent → returns null → caller's
+// Tickertape/Yahoo cascade runs unchanged). Uses the SAME portable epoch-floor
+// bucketing as the origin (queries.py GET_INTRADAY_CANDLES). Never throws.
+async function pgIntraday(env, ctx, symbol, bucketSec, startISO, endISO) {
+  if (!env || !env.PG || !env.PG.connectionString) return null;   // binding not wired → skip
+  let sql;
+  try {
+    // Hyperdrive pooling: no cross-connection prepared statements, skip type probe.
+    sql = postgres(env.PG.connectionString, { max: 1, prepare: false, fetch_types: false, idle_timeout: 8 });
+    const rows = await sql`
+      SELECT to_timestamp(floor(extract(epoch FROM time) / ${bucketSec}) * ${bucketSec}) AS bucket,
+             (array_agg(open  ORDER BY time ASC))[1]  AS open,
+             max(high)                                AS high,
+             min(low)                                 AS low,
+             (array_agg(close ORDER BY time DESC))[1] AS close,
+             sum(volume)                              AS volume
+      FROM intraday_candles
+      WHERE symbol = ${symbol} AND exchange = 'NSE'
+        AND time >= ${startISO} AND time < ${endISO}
+      GROUP BY bucket ORDER BY bucket ASC`;
+    return rows.map((r) => {
+      const ts = new Date(r.bucket).toISOString();
+      const o = num(r.open), h = num(r.high), l = num(r.low), c = num(r.close), v = int(r.volume);
+      return { timestamp: ts, open: o, high: h, low: l, close: c, volume: v, oi: 0, 0: ts, 1: o, 2: h, 3: l, 4: c, 5: v };
+    });
+  } catch {
+    return null;   // PG unreachable / symbol not captured → caller falls back
+  } finally {
+    if (sql) ctx.waitUntil(sql.end({ timeout: 5 }).catch(() => {}));
+  }
+}
+
+async function handleIntraday(url, symbol, ctx, env) {
   const interval = url.searchParams.get("interval") || "30minute";
-  if (isSubMinute(interval)) return subMinuteResp(interval, { source: "tickertape" });
+  if (isSubMinute(interval)) {
+    // PG-first (NF 1s store) when Hyperdrive is wired; else honest empty.
+    const rows = await pgIntraday(env, ctx, symbol.toUpperCase(), barMs(interval) / 1000,
+      new Date(Date.now() - 24 * 3600_000).toISOString(), new Date().toISOString());
+    if (rows && rows.length) return json({ candles: rows, source: "northflank_pg_1s", interval, count: rows.length, dataQuality: "INTRADAY_STORE" });
+    return subMinuteResp(interval, { source: "tickertape" });
+  }
   const sid = await resolveSid(symbol, ctx);
   if (!sid) return json({ candles: [], source: "tickertape", note: "sid-unresolved" });
   const j = await ttGet(`/stocks/charts/inter/${encodeURIComponent(sid)}`, `?duration=1d`);
@@ -303,9 +349,17 @@ async function handleCandles(url, symbol, ctx) {
   }
   return json({ symbol, interval, range, count: candles.length, liveLastBar: liveLast, candles, pastSource: "yahoo", todaySource: liveLast ? "tickertape_live" : null });
 }
-async function handleHistory(url, symbol, ctx) {
+async function handleHistory(url, symbol, ctx, env) {
   const rawInt = url.searchParams.get("interval") || "30minute";
-  if (isSubMinute(rawInt)) return subMinuteResp(rawInt, { symbol });
+  if (isSubMinute(rawInt)) {
+    // PG-first (NF 1s store) for the requested window; honest empty if not wired/captured.
+    const f = url.searchParams.get("from"), t = url.searchParams.get("to");
+    const startISO = (f ? new Date(f) : new Date(Date.now() - 24 * 3600_000)).toISOString();
+    const endISO = new Date((t ? Date.parse(t) + 86400_000 : Date.now())).toISOString();
+    const rows = await pgIntraday(env, ctx, symbol.toUpperCase(), barMs(rawInt) / 1000, startISO, endISO);
+    if (rows && rows.length) return json({ symbol, interval: rawInt, source: "northflank_pg_1s", count: rows.length, candles: rows });
+    return subMinuteResp(rawInt, { symbol });
+  }
   const interval = yhInterval(rawInt);
   let from = url.searchParams.get("from");
   const to = url.searchParams.get("to");
@@ -478,9 +532,9 @@ export default {
     let resp;
     try {
       if (pathname === "/api/v1/sb/quotes") resp = await handleQuotes(url, ctx);
-      else if (pathname.startsWith("/api/v1/sb/intraday/")) resp = await handleIntraday(url, seg, ctx);
+      else if (pathname.startsWith("/api/v1/sb/intraday/")) resp = await handleIntraday(url, seg, ctx, env);
       else if (pathname.startsWith("/api/v1/sb/candles/")) resp = await handleCandles(url, seg, ctx);
-      else if (pathname.startsWith("/api/v1/sb/history/")) resp = await handleHistory(url, seg, ctx);
+      else if (pathname.startsWith("/api/v1/sb/history/")) resp = await handleHistory(url, seg, ctx, env);
       else if (pathname === "/api/v1/sb/context") resp = await handleContext();
       else if (pathname === "/api/v1/sb/mmi") { const m = await ttGet("/mmi/now"); resp = json(m?.data || m || {}); }
       else if (pathname.startsWith("/api/v1/sb/fundamentals/")) resp = await handleFundamentals(seg);
