@@ -116,10 +116,15 @@ function ttToQuote(sym, r, open) {
 }
 // Session open = first intraday tick; fixed once set at 09:15, so cache per
 // (symbol, IST-day) — a quote sweep costs ~0 extra after the first fill.
-async function openForSymbol(sid, ctx) {
+async function openForSymbol(sid, ctx, budget) {
   const key = new Request(`https://edge.open/${istDate()}/${encodeURIComponent(sid)}`);
   const hit = await caches.default.match(key);
-  if (hit) { const v = Number(await hit.text()); return v > 0 ? v : null; }
+  if (hit) { const v = Number(await hit.text()); return v > 0 ? v : null; }   // cache hit = free, never counts
+  // A cold miss = a real upstream fetch (counts toward the 50-subreq/invocation cap).
+  // Honor the shared per-invocation budget so a big COLD batch can't blow the limit;
+  // budget-exhausted symbols ship without `open` and fill in once the edge cache warms.
+  // (check + decrement are synchronous → exactly `budget.n` misses get through.)
+  if (budget) { if (budget.n <= 0) return null; budget.n--; }
   const j = await ttGet(`/stocks/charts/inter/${encodeURIComponent(sid)}`, `?duration=1d`);
   const pts = j?.data?.[0]?.points || [];
   const today = istDate();
@@ -129,47 +134,89 @@ async function openForSymbol(sid, ctx) {
   return open > 0 ? open : null;
 }
 async function handleQuotes(url, ctx) {
+  // fast=true (bulk ranking sweeps from the caller) skips the per-symbol session-open
+  // backfill. Each `openForSymbol` is its own upstream fetch, so for a 30-symbol batch
+  // that is ~30 extra subrequests — enough on its own to blow Cloudflare's free-tier
+  // 50-subrequests-per-invocation cap. The caller doesn't need `open` on those sweeps.
+  const fast = url.searchParams.get("fast") === "true";
   const symbols = [...new Set((url.searchParams.get("symbols") || "").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean))].slice(0, 45);
   if (!symbols.length) return json({ quotes: [] });
+  // Per-invocation letter memo. resolveSid → letterList fetches the Tickertape list for
+  // a symbol's FIRST LETTER; without memoizing, a Promise.all over N symbols fires N
+  // concurrent fetches (the edge cache hasn't filled yet, so every symbol misses). A
+  // batch only spans a handful of distinct letters, so memo collapses N fetches → ~#letters.
+  const letterMemo = new Map();
   const sidMap = new Map();
-  await Promise.all(symbols.map(async (s) => { const sid = await resolveSid(s, ctx); if (sid) sidMap.set(s, sid); }));
+  // Per-symbol catch: one letter's upstream blip must not reject the whole batch.
+  await Promise.all(symbols.map(async (s) => { const sid = await resolveSid(s, ctx, letterMemo).catch(() => null); if (sid) sidMap.set(s, sid); }));
   if (!sidMap.size) return json({ quotes: [], count: 0, source: "tickertape_realtime_nse" });
   const j = await ttGet("/stocks/quotes", `?sids=${[...sidMap.values()].join(",")}`);
   const bySid = new Map((j?.data || []).map((r) => [r.sid, r]));
+  // HARD subrequest ceiling. Per invocation the only upstream fetches are:
+  //   ≤26 letterList (one per A–Z, memoized) + 1 quotes batch + 1 per COLD-MISS
+  //   open-backfill. A non-fast 30-symbol batch with a cold cache spanning many
+  //   distinct letters could otherwise reach 26 + 1 + 30 = 57 > 50 (free-tier cap).
+  //   A shared budget caps the cold open-fetches so 26 + 20 + 1 = 47 < 50 holds in
+  //   EVERY state. Warm symbols (open already cached) are served free and unbounded;
+  //   only cold misses spend budget, and any skipped symbol just ships without `open`.
+  const openBudget = { n: 20 };
   const quotes = (await Promise.all([...sidMap.entries()].map(async ([sym, sid]) => {
     const r = bySid.get(sid); if (!r) return null;
-    return ttToQuote(sym, r, await openForSymbol(sid, ctx).catch(() => null));
+    const open = fast ? null : await openForSymbol(sid, ctx, openBudget).catch(() => null);
+    return ttToQuote(sym, r, open);
   }))).filter(Boolean);
   return json({ quotes, count: quotes.length, source: "tickertape_realtime_nse", asOf: new Date().toISOString() });
 }
 
 // ── sid resolution (Tickertape universe, cached per-letter) ──────────────────
-async function letterList(letter, ctx) {
+async function letterList(letter, ctx, memo) {
   letter = letter.toLowerCase();
-  const key = new Request(`https://edge.sid/${letter}`);
-  const hit = await caches.default.match(key);
-  if (hit) return hit.json();
-  const j = await ttGet("/stocks/list", `?filter=${letter}`);
-  const rows = (j?.data || []).filter((x) => x?.ticker && x?.sid)
-    .map((x) => ({ ticker: String(x.ticker).toUpperCase(), sid: x.sid, name: x.name || x.ticker, isin: x.isin || null }));
-  ctx.waitUntil(caches.default.put(key, new Response(JSON.stringify(rows), { headers: { "cache-control": "public, max-age=86400" } })));
-  return rows;
+  // Dedupe concurrent + repeat lookups of the same letter within one invocation:
+  // return the in-flight promise so N symbols on letter "w" share ONE upstream fetch.
+  if (memo && memo.has(letter)) return memo.get(letter);
+  const p = (async () => {
+    const key = new Request(`https://edge.sid/${letter}`);
+    const hit = await caches.default.match(key);
+    if (hit) return hit.json();
+    const j = await ttGet("/stocks/list", `?filter=${letter}`);
+    const rows = (j?.data || []).filter((x) => x?.ticker && x?.sid)
+      .map((x) => ({ ticker: String(x.ticker).toUpperCase(), sid: x.sid, name: x.name || x.ticker, isin: x.isin || null }));
+    ctx.waitUntil(caches.default.put(key, new Response(JSON.stringify(rows), { headers: { "cache-control": "public, max-age=86400" } })));
+    return rows;
+  })();
+  if (memo) memo.set(letter, p);
+  return p;
 }
-async function resolveSid(symbol, ctx) {
+async function resolveSid(symbol, ctx, memo) {
   symbol = symbol.toUpperCase();
   if (SID_SEED[symbol]) return SID_SEED[symbol];
   if (!/[A-Z]/.test(symbol[0])) return null;
-  return (await letterList(symbol[0], ctx)).find((r) => r.ticker === symbol)?.sid || null;
+  return (await letterList(symbol[0], ctx, memo)).find((r) => r.ticker === symbol)?.sid || null;
 }
 
 // ── LIVE intraday (Tickertape ticks → OHLC) ──────────────────────────────────
-function barMinutes(interval) {
-  if (/day|^1d/i.test(interval)) return 1440;
-  const m = String(interval || "").match(/(\d+)/);
-  return Math.max(1, m ? Number(m[1]) : 30);
+// ── interval parsing (sub-ms → daily) ────────────────────────────────────────
+// Tickertape's finest native tick is 60s and a stateless Worker can't record a
+// live stream, so any bar < 1 minute has NO real source. Those are surfaced
+// honestly (empty + note) rather than faked from 1-min ticks. The real, supported
+// grid — all served like the 30m the V9 scanner already uses — is:
+//   1m / 5m / 15m / 30m / 1h : today from Tickertape 60s ticks (bucketed),
+//                              past days from Yahoo native intraday bars.
+const MIN_BAR_MS = 60_000;
+function barMs(interval) {
+  const s = String(interval || "30minute").trim().toLowerCase();
+  const n = parseFloat(s);
+  const v = Number.isFinite(n) ? n : 1;
+  if (/milli|\dms\b|^\d+ms$/.test(s)) return Math.max(1, Math.round(v));                 // 500ms
+  if (/sec|second|^\d+s$|\ds\b/.test(s)) return Math.max(1, Math.round(v * 1_000));      // 1s / 10s
+  if (/hour|hr|^\d+h$|\dh\b/.test(s)) return Math.round(v * 3_600_000);                   // 1h
+  if (/day|daily|^\d+d$|\dd\b/.test(s)) return Math.round(v * 86_400_000);                // 1d
+  return Math.round((Number.isFinite(n) ? n : 30) * 60_000);                             // minutes (default)
 }
-function bucketPoints(points, minutes) {
-  const ms = minutes * 60_000, b = new Map();
+const isSubMinute = (interval) => barMs(interval) < MIN_BAR_MS;
+
+function bucketPoints(points, bucketMs) {
+  const ms = Math.max(1, bucketMs), b = new Map();
   for (const p of points) {
     const t = Date.parse(p.ts); if (!Number.isFinite(t)) continue;
     const k = Math.floor(t / ms) * ms, lp = num(p.lp), v = int(p.v);
@@ -183,30 +230,44 @@ function bucketPoints(points, minutes) {
       0: ts, 1: o.open, 2: o.high, 3: o.low, 4: o.close, 5: o.volume };
   });
 }
-async function ttTodayBars(symbol, minutes, ctx) {
+async function ttTodayBars(symbol, bucketMs, ctx) {
   const sid = await resolveSid(symbol, ctx);
   if (!sid) return [];
   const j = await ttGet(`/stocks/charts/inter/${encodeURIComponent(sid)}`, `?duration=1d`);
   const today = istDate();
-  return bucketPoints(j?.data?.[0]?.points || [], minutes).filter((c) => c.timestamp.slice(0, 10) === today);
+  return bucketPoints(j?.data?.[0]?.points || [], bucketMs).filter((c) => c.timestamp.slice(0, 10) === today);
+}
+function subMinuteResp(interval, extra = {}) {
+  return json({ candles: [], count: 0, interval, note: "sub-minute-unsupported", finest: "1minute",
+    reason: "no sub-minute source on the stateless edge (Tickertape ticks are 60s); use the origin sampler for 1s/10s", ...extra });
 }
 async function handleIntraday(url, symbol, ctx) {
   const interval = url.searchParams.get("interval") || "30minute";
+  if (isSubMinute(interval)) return subMinuteResp(interval, { source: "tickertape" });
   const sid = await resolveSid(symbol, ctx);
   if (!sid) return json({ candles: [], source: "tickertape", note: "sid-unresolved" });
   const j = await ttGet(`/stocks/charts/inter/${encodeURIComponent(sid)}`, `?duration=1d`);
-  const candles = bucketPoints(j?.data?.[0]?.points || [], barMinutes(interval));
+  const candles = bucketPoints(j?.data?.[0]?.points || [], barMs(interval));
   return json({ candles, source: "tickertape_realtime_nse", interval,
     dataQuality: isMarketOpen() ? "REAL_TIME" : "TODAY_SESSION", count: candles.length });
 }
 
 // ── HISTORICAL candles/history (Yahoo for PAST; today from live) ─────────────
+// Requested interval → nearest Yahoo NATIVE granularity Yahoo actually serves
+// (1m,5m,15m,30m,60m,1d). null = sub-minute (Yahoo has none).
 function yhInterval(interval) {
-  const s = String(interval || "1d").toLowerCase();
-  if (/day|^1d$/.test(s)) return "1d";
-  const n = (s.match(/(\d+)/) || [, "30"])[1];
-  return /hour|h/.test(s) ? `${n}h` : `${n}m`;
+  const ms = barMs(interval);
+  if (ms < MIN_BAR_MS) return null;
+  if (ms >= 86_400_000) return "1d";
+  if (ms >= 3_600_000) return "60m";
+  if (ms >= 1_800_000) return "30m";
+  if (ms >= 900_000) return "15m";
+  if (ms >= 300_000) return "5m";
+  return "1m";
 }
+// Yahoo serves 1m for only ≤8 calendar days per request; clamp any wider named
+// range down to a value it accepts. (5m/15m/30m/60m allow ~60 days — untouched.)
+const clampRange1m = (range) => (["1d", "5d"].includes(range) ? range : "5d");
 function yahooCandles(j) {
   const r = j?.chart?.result?.[0]; if (!r) return [];
   const ts = r.timestamp || [], q = r.indicators?.quote?.[0] || {}, out = [];
@@ -219,8 +280,11 @@ function yahooCandles(j) {
   return out;
 }
 async function handleCandles(url, symbol, ctx) {
-  const range = url.searchParams.get("range") || "6mo";
-  const interval = yhInterval(url.searchParams.get("interval") || "1d");
+  const rawInterval = url.searchParams.get("interval") || "1d";
+  if (isSubMinute(rawInterval)) return subMinuteResp(rawInterval, { symbol });
+  const interval = yhInterval(rawInterval);
+  let range = url.searchParams.get("range") || "6mo";
+  if (interval === "1m") range = clampRange1m(range);
   const today = istDate();
   const j = await getJson(`${YH(symbol + ".NS")}?range=${range}&interval=${interval}`);
   let candles = yahooCandles(j).filter((c) => c.timestamp.slice(0, 10) < today);   // Yahoo = PAST only
@@ -228,7 +292,7 @@ async function handleCandles(url, symbol, ctx) {
   if (interval === "1d") {
     // TODAY's daily bar from the live Tickertape session (aggregate the day's
     // ticks into one OHLC bar) — never Yahoo for the current day.
-    const tb = await ttTodayBars(symbol, 1440, ctx).catch(() => []);
+    const tb = await ttTodayBars(symbol, 86_400_000, ctx).catch(() => []);
     const b = tb[tb.length - 1];
     if (b) {
       const ts = `${today}T03:45:00.000Z`;
@@ -241,16 +305,34 @@ async function handleCandles(url, symbol, ctx) {
 }
 async function handleHistory(url, symbol, ctx) {
   const rawInt = url.searchParams.get("interval") || "30minute";
+  if (isSubMinute(rawInt)) return subMinuteResp(rawInt, { symbol });
   const interval = yhInterval(rawInt);
-  const from = url.searchParams.get("from"), to = url.searchParams.get("to");
+  let from = url.searchParams.get("from");
+  const to = url.searchParams.get("to");
   const today = istDate();
+  // Yahoo serves 1m for only ≤8 calendar days/request → clamp the window so it
+  // doesn't 422. (5m/15m/30m/60m allow ~60 days, left as requested.)
+  if (interval === "1m" && from && to) {
+    const minFrom = Date.parse(to) - 7 * 86_400_000;
+    if (Date.parse(from) < minFrom) from = new Date(minFrom).toISOString().slice(0, 10);
+  }
   let qs = `interval=${interval}`;
   if (from && to) qs += `&period1=${Math.floor(Date.parse(from) / 1000)}&period2=${Math.floor(Date.parse(to) / 1000) + 86400}`;
-  else qs += `&range=${url.searchParams.get("range") || "3mo"}`;
+  else qs += `&range=${interval === "1m" ? "5d" : (url.searchParams.get("range") || "3mo")}`;
   const j = await getJson(`${YH(symbol + ".NS")}?${qs}`);
-  let candles = yahooCandles(j).filter((c) => c.timestamp.slice(0, 10) < today);   // Yahoo = PAST only
-  // TODAY from the live scraper (Tickertape), never Yahoo.
-  const todayBars = await ttTodayBars(symbol, barMinutes(rawInt), ctx).catch(() => []);
+  // Clip Yahoo to the requested window AND to strictly-past days (today is live-only).
+  let candles = yahooCandles(j).filter((c) => {
+    const day = c.timestamp.slice(0, 10);
+    if (day >= today) return false;                 // today never from Yahoo (15-min delayed)
+    if (from && day < from) return false;           // respect explicit lower bound
+    if (to && day > to) return false;               // respect explicit upper bound
+    return true;
+  });
+  // TODAY from the live scraper (Tickertape) — ONLY when the requested window
+  // actually reaches today. A specific PAST window (e.g. from/to = Jun 20–22) must
+  // NOT get today's bars stapled on; skipping it also saves an upstream subrequest.
+  const wantsToday = !to || to >= today;
+  const todayBars = wantsToday ? await ttTodayBars(symbol, barMs(rawInt), ctx).catch(() => []) : [];
   candles = candles.concat(todayBars).sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
   return json({ symbol, interval, count: candles.length, candles, pastSource: "yahoo", todaySource: todayBars.length ? "tickertape_live" : null });
 }
