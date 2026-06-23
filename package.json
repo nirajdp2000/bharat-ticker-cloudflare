@@ -1,8 +1,8 @@
 {
   "name": "bharat-ticker-cloudflare",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "private": true,
-  "description": "Cloudflare Worker edge proxy + cache in front of the Northflank bharat-ticker API. Does not host the app.",
+  "description": "Native Cloudflare Worker (free plan) reimplementing the bharat /api/v1/sb/* feed — real-time Groww/Tickertape quotes+intraday, Yahoo for history. No origin, no container.",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",

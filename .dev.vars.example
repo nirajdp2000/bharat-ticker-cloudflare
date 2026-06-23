@@ -1,10 +1,10 @@
-# Copy to .dev.vars for `wrangler dev` (git-ignored). In production use:
-#   wrangler secret put CLIENT_API_KEY
-#   wrangler secret put ORIGIN_API_KEY
-
-# Require callers to send x-api-key: <value>  (or ?key=<value>). Leave unset = open.
-CLIENT_API_KEY=
-
-# Forwarded to the Northflank origin as header x-edge-key. Optional lock so only
-# this Worker can hit origin (origin must check it — currently it does not).
-ORIGIN_API_KEY=
+# Copy to .dev.vars for `wrangler dev` (git-ignored).
+#
+# The container app runs OPEN by default (no auth needed) and boots zero-infra
+# (in-memory store, deferred DB), so NO secrets are required to deploy.
+#
+# Optional — set on the CONTAINER (add to envVars in src/index.js, or as wrangler
+# secrets wired through) only if you want them:
+#   API_KEY=          # require X-API-Key on the data API (else open)
+#   DATABASE_URL=     # postgresql+asyncpg://...  durable history (else deferred)
+#   REDIS_URL=        # redis://...               shared cache (else in-process)

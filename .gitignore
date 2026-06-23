@@ -4,3 +4,11 @@ node_modules/
 dist/
 *.log
 .DS_Store
+
+# Python build/runtime junk from the vendored app/ (image is built from source)
+__pycache__/
+*.pyc
+.pytest_cache/
+app/.env
+.venv/
+venv/

@@ -1,88 +1,75 @@
 # bharat-ticker-cloudflare
 
-Cloudflare **Worker edge proxy + cache** that sits in **front of** the Northflank
-`bharat-ticker` deployment. It speeds up reads at Cloudflare's edge and gives you
-CDN / WAF / custom-domain in front of the API — **without touching Northflank**.
-
-## Why this is a proxy, not a port
-
-The real `bharat-ticker` app cannot run on Cloudflare:
-
-- `curl-cffi` — native libcurl (TLS impersonation for Groww/Tickertape/BSE)
-- `playwright` — needs a real Chromium process
-- `asyncpg` / `uvloop` — native, persistent event loop
-- live tick-sampler / SSE / in-memory cache — need a **long-lived process**
-
-Cloudflare Workers run on V8 isolates (or Pyodide WASM) with no persistent
-process and no native binaries, so a faithful port is impossible. The app stays
-on Northflank; this Worker just proxies + caches it at the edge.
+A **native Cloudflare Worker** (runs on the **FREE** plan) that reimplements the
+bharat-ticker `/api/v1/sb/*` feed directly at the edge — no origin, no container,
+no Northflank. It fetches real Indian-market data with plain `fetch` (verified
+that Groww + Tickertape answer Cloudflare-style TLS with no `curl-cffi` browser
+impersonation needed).
 
 ```
-client ──▶ Cloudflare Worker (this repo) ──▶ Northflank bharat-ticker (origin)
-              edge cache / SWR / CORS              real app, unchanged
+localhost / superbrain ──▶ Cloudflare Worker (src/index.js) ──▶ Groww · Tickertape · Yahoo
+                              free plan, native JS                real-time NSE   /   history
 ```
 
-## What it does
+## Data-latency contract (mirrors the app's armed rule)
 
-- Proxies every path to `ORIGIN` (set in `wrangler.toml`).
-- Edge-caches GET reads with per-route TTL + **stale-while-revalidate**
-  (serves stale instantly, refreshes in background). See `CACHE_RULES` in
-  [`src/worker.js`](src/worker.js).
-- Passes **SSE** (`/sb/stream/*`), **WebSocket** (`/ws/ticks*`), and all
-  POST/mutations straight through, uncached.
-- Adds CORS. Optional client API-key gate.
+**Lowest-latency live data only — Yahoo is 15-min delayed, so it is used for
+history exclusively.**
 
-| Route | Edge TTL | Stale-while-revalidate |
+| Endpoint | Source | Latency |
 |---|---|---|
-| `/sb/quotes`, `/sb/quote/*` | 5s | 10s |
-| `/sb/intraday/*` | 20s | 40s |
-| `/sb/scans`, `/sb/screen` | 30s | 60s |
-| `/sb/candles/*`, `/sb/history/*` | 120s | 600s |
-| `/sb/context`, `/sb/mmi` | 300s | 900s |
-| `/sb/fundamentals/*`, `/sb/universe`, `/sb/resolve`, `/sb/intervals` | 1h | 2h |
-| `/sb/stream/*`, `/ws/*`, `/sb/recorder`, `/sb/warm`, `/sb/cache`, `/sb/diagnostics`, `/ping` | no cache | — |
+| `GET /api/v1/sb/quotes?symbols=A,B` | **Groww** `latest_prices_ohlc` | **real-time** NSE (LTP/OHLC, change, volume, 52-wk, circuits) |
+| `GET /api/v1/sb/intraday/{sym}?interval=30minute` | **Tickertape** `charts/inter` (ticks → OHLC buckets) | **real-time** NSE |
+| `GET /api/v1/sb/candles/{sym}?range=6mo&interval=1d` | Yahoo | historical daily |
+| `GET /api/v1/sb/history/{sym}?interval=30minute&from=&to=` | Yahoo | historical |
+| `GET /api/v1/ping` | — | liveness |
 
-Every response carries `x-edge-cache: HIT | STALE | MISS | BYPASS` and
-`x-edge-age` so you can see what the edge did.
+A live endpoint that can't reach a real-time source returns nothing for that
+symbol (`quotes`: omitted; `intraday`: `[]`) so the caller's armed cascade fills
+it — **delayed data is never served as live.** Unimplemented `/sb/*` endpoints
+(`context`, `fundamentals`, `resolve`) return `{}` so the caller falls back cleanly.
 
-## Deploy
+## How it works
+
+- **Quotes** — fan out one Groww call per symbol in parallel, map to the exact
+  superbrain quote shape. localhost chunks at 30 symbols/call, so each invocation
+  makes ≤30 subrequests (well under the free plan's 50/invocation cap).
+- **Intraday** — resolve the Tickertape `sid` (seeded for hot names, else one
+  cached `/stocks/list?filter=<letter>` lookup), pull today's real ticks, bucket
+  them into the requested interval's OHLC bars.
+- **Edge cache** — short per-route TTL (quotes 5s, intraday 20s, candles 120s,
+  history 600s) via the Cache API, so a burst of pollers shares one upstream
+  sweep. Responses carry `x-edge-cache: HIT|MISS` + `x-edge-age`.
+
+## Deploy (free)
 
 ```bash
 npm install
+npx wrangler login
 npx wrangler deploy
 ```
 
-First deploy prompts a Cloudflare login. Worker goes live at
-`https://bharat-ticker-cloudflare.<your-subdomain>.workers.dev`.
+No paid plan, no Docker, no secrets. Goes live at
+`https://bharat-ticker-cloudflare.<acct>.workers.dev` — the same URL localhost
+already points at, so **no localhost change needed**; the CF endpoint now serves
+real scraped data instead of proxying Northflank.
 
-### Config
-
-Edit `wrangler.toml` → `[vars].ORIGIN` if the Northflank URL changes.
-
-Optional secrets (never commit these):
+## Verify after deploy
 
 ```bash
-wrangler secret put CLIENT_API_KEY   # require x-api-key on every request
-wrangler secret put ORIGIN_API_KEY   # forwarded to origin as x-edge-key
+curl "https://bharat-ticker-cloudflare.<acct>.workers.dev/api/v1/sb/quotes?symbols=RELIANCE,TCS"
+curl "https://bharat-ticker-cloudflare.<acct>.workers.dev/api/v1/sb/intraday/RELIANCE?interval=30minute"
+curl "https://bharat-ticker-cloudflare.<acct>.workers.dev/api/v1/sb/candles/RELIANCE?range=1mo&interval=1d"
 ```
 
-### Local dev
+> **Egress-IP caveat:** the Worker scrapes from Cloudflare's IPs. Groww/Tickertape
+> were reachable in testing; if they ever rate-limit/block the edge, live calls
+> return empty and the caller armed-fills. Re-check with the commands above.
 
-```bash
-cp .dev.vars.example .dev.vars   # fill in secrets if you use them
-npx wrangler dev
-```
+## Scope / limits
 
-## Custom domain (optional)
-
-In the Cloudflare dashboard: **Workers & Pages → this worker → Settings →
-Domains & Routes → Add custom domain** (e.g. `api.yourdomain.com`). DNS is wired
-automatically; Northflank is unaffected.
-
-## Test after deploy
-
-```bash
-curl -i https://bharat-ticker-cloudflare.<sub>.workers.dev/api/v1/ping
-curl -i https://bharat-ticker-cloudflare.<sub>.workers.dev/api/v1/sb/quotes?symbols=RELIANCE
-#   ^ second identical call within 5s returns x-edge-cache: HIT
-```
+- Live = quotes + today's intraday. Historical candles/history = Yahoo.
+- `context` / `fundamentals` / `resolve` not yet ported (return `{}` → caller
+  fallback). Add later if needed.
+- Free Workers: 100k req/day, 50 subrequests/invocation — fine for localhost's
+  30-symbol chunks.
