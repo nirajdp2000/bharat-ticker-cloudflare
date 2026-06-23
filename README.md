@@ -21,9 +21,9 @@ live source; Yahoo is used only for dates `< today`.
 
 | Endpoint | Source | Latency |
 |---|---|---|
-| `GET /api/v1/sb/quotes?symbols=A,B` | **Groww** `latest_prices_ohlc` | **real-time** NSE (LTP/OHLC, change, vol, 52-wk, circuits, buy/sell qty, OI) |
+| `GET /api/v1/sb/quotes?symbols=A,B` | **Tickertape** `/stocks/quotes` (+ open from intraday) | **real-time** NSE (price/OHLC/change/vol) |
 | `GET /api/v1/sb/intraday/{sym}?interval=30minute` | **Tickertape** ticks → OHLC | **real-time** NSE |
-| `GET /api/v1/sb/candles/{sym}?range=6mo&interval=1d` | Yahoo (`<today`) **+ today from Groww** | past historical · today live |
+| `GET /api/v1/sb/candles/{sym}?range=6mo&interval=1d` | Yahoo (`<today`) **+ today from Tickertape** | past historical · today live |
 | `GET /api/v1/sb/history/{sym}?interval=30minute&from=&to=` | Yahoo (`<today`) **+ today from Tickertape** | past historical · today live |
 | `GET /api/v1/sb/context` | **NSE** indices/VIX/FII-DII · **Investing** macro · **Tickertape** MMI | real-time |
 | `GET /api/v1/sb/fundamentals/{sym}` | **screener.in** | ratios |
@@ -73,9 +73,11 @@ curl "https://bharat-ticker-cloudflare.<acct>.workers.dev/api/v1/sb/intraday/REL
 curl "https://bharat-ticker-cloudflare.<acct>.workers.dev/api/v1/sb/candles/RELIANCE?range=1mo&interval=1d"
 ```
 
-> **Egress-IP caveat:** the Worker scrapes from Cloudflare's IPs. Groww/Tickertape
-> were reachable in testing; if they ever rate-limit/block the edge, live calls
-> return empty and the caller armed-fills. Re-check with the commands above.
+> **Egress-IP note:** the Worker scrapes from Cloudflare's IPs. Verified live from
+> the deployed edge: Tickertape, NSE, Investing.com, screener.in, Yahoo all answer.
+> **Groww blocks Cloudflare IPs** (returned empty), so quotes + today's daily bar
+> were rerouted to Tickertape. If another source starts blocking the edge, those
+> calls return empty and the caller armed-fills.
 
 ## Scope / limits
 

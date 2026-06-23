@@ -91,43 +91,56 @@ const ttGet = (path, qs = "") => getJson(`${TT}${path}${qs}`);
 // isn't datacenter-blocked. Best-effort — null on block (caller degrades).
 const nseGet = (path, referer) => getJson(`${NSE}${path}`, { Referer: referer || `${NSE}/`, "Accept-Language": "en-US,en;q=0.9" });
 
-// ── LIVE quotes (Groww) ──────────────────────────────────────────────────────
-function growwToQuote(sym, d) {
-  const price = num(d?.ltp) || num(d?.close);
+// ── LIVE quotes (Tickertape batch) ───────────────────────────────────────────
+// NOTE: Groww answered a residential IP but BLOCKS Cloudflare's datacenter IPs
+// (quotes came back empty from the deployed edge). Tickertape's batch endpoint
+// IS reachable from Workers and is real-time NSE, so quotes route through it.
+// Trade-off: Tickertape batch lacks Groww-only fields (circuits, 52-wk, buy/sell
+// qty, OI) — none of which localhost consumes. `open` (which it DOES use) is
+// recovered from the day's first intraday tick, cached per (symbol, day).
+function ttToQuote(sym, r, open) {
+  const price = num(r?.price);
   if (!(price > 0)) return null;
-  const prev = num(d.close);
-  const live = isMarketOpen();
-  // Groww relays no reliable per-tick stamp (tsInMillis is the last-trade time,
-  // stale off-hours), so — like NF — we stamp asOf with fetch time: feedLagSec 0.
-  const asOf = new Date().toISOString();
+  const prev = num(r.close), change = num(r.change), live = isMarketOpen();
+  const now = new Date().toISOString();
   const q = {
-    symbol: sym, companyName: sym, sector: undefined,
-    price: +price.toFixed(2),
-    change: num(d.dayChange), changePct: num(d.dayChangePerc),
-    open: num(d.open) || undefined, high: num(d.high) || price, low: num(d.low) || price,
-    volume: int(d.volume), previousClose: prev || undefined,
-    upperCircuit: num(d.highPriceRange) || undefined, lowerCircuit: num(d.lowPriceRange) || undefined,
-    week52High: num(d.yearHighPrice) || undefined, week52Low: num(d.yearLowPrice) || undefined,
-    totalBuyQty: d.totalBuyQty != null ? int(d.totalBuyQty) : undefined,
-    totalSellQty: d.totalSellQty != null ? int(d.totalSellQty) : undefined,
-    openInterest: d.openInterest != null ? int(d.openInterest) : undefined,
-    source: "groww", dataQuality: live ? "REAL_TIME" : "LAST_CLOSE", live,
-    feedLatencyMs: 0,
-    asOf, fetchedAt: new Date().toISOString(),
-    feedLagSec: Math.max(0, Math.round((Date.now() - Date.parse(asOf)) / 100) / 10),
+    symbol: sym, companyName: sym,
+    price: +price.toFixed(2), change, changePct: prev > 0 ? +((change / prev) * 100).toFixed(2) : 0,
+    open: open || undefined, high: num(r.high) || price, low: num(r.low) || price,
+    volume: int(r.volume), previousClose: prev || undefined,
+    source: "tickertape_realtime_nse", dataQuality: live ? "REAL_TIME" : "LAST_CLOSE", live,
+    feedLatencyMs: 0, asOf: now, fetchedAt: now, feedLagSec: 0,
   };
-  // 52w bounds must contain live price/range (mirror NF clamp)
-  if (q.week52Low != null) q.week52Low = Math.min(...[q.week52Low, q.low, q.price].filter((x) => x != null));
-  if (q.week52High != null) q.week52High = Math.max(...[q.week52High, q.high, q.price].filter((x) => x != null));
-  for (const k of Object.keys(q)) if (q[k] === undefined) delete q[k];   // drop null optionals (NF parity)
+  for (const k of Object.keys(q)) if (q[k] === undefined) delete q[k];
   return q;
 }
-async function handleQuotes(url) {
+// Session open = first intraday tick; fixed once set at 09:15, so cache per
+// (symbol, IST-day) — a quote sweep costs ~0 extra after the first fill.
+async function openForSymbol(sid, ctx) {
+  const key = new Request(`https://edge.open/${istDate()}/${encodeURIComponent(sid)}`);
+  const hit = await caches.default.match(key);
+  if (hit) { const v = Number(await hit.text()); return v > 0 ? v : null; }
+  const j = await ttGet(`/stocks/charts/inter/${encodeURIComponent(sid)}`, `?duration=1d`);
+  const pts = j?.data?.[0]?.points || [];
+  const today = istDate();
+  const first = pts.find((p) => String(p.ts).slice(0, 10) === today) || pts[0];
+  const open = first ? num(first.lp) : 0;
+  if (open > 0) ctx.waitUntil(caches.default.put(key, new Response(String(open), { headers: { "cache-control": "public, max-age=28800" } })));
+  return open > 0 ? open : null;
+}
+async function handleQuotes(url, ctx) {
   const symbols = [...new Set((url.searchParams.get("symbols") || "").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean))].slice(0, 45);
   if (!symbols.length) return json({ quotes: [] });
-  const settled = await Promise.allSettled(symbols.map(async (s) => growwToQuote(s, await getJson(GROWW(s)))));
-  const quotes = settled.filter((r) => r.status === "fulfilled" && r.value).map((r) => r.value);
-  return json({ quotes, count: quotes.length, source: "groww", asOf: new Date().toISOString() });
+  const sidMap = new Map();
+  await Promise.all(symbols.map(async (s) => { const sid = await resolveSid(s, ctx); if (sid) sidMap.set(s, sid); }));
+  if (!sidMap.size) return json({ quotes: [], count: 0, source: "tickertape_realtime_nse" });
+  const j = await ttGet("/stocks/quotes", `?sids=${[...sidMap.values()].join(",")}`);
+  const bySid = new Map((j?.data || []).map((r) => [r.sid, r]));
+  const quotes = (await Promise.all([...sidMap.entries()].map(async ([sym, sid]) => {
+    const r = bySid.get(sid); if (!r) return null;
+    return ttToQuote(sym, r, await openForSymbol(sid, ctx).catch(() => null));
+  }))).filter(Boolean);
+  return json({ quotes, count: quotes.length, source: "tickertape_realtime_nse", asOf: new Date().toISOString() });
 }
 
 // ── sid resolution (Tickertape universe, cached per-letter) ──────────────────
@@ -175,7 +188,7 @@ async function ttTodayBars(symbol, minutes, ctx) {
   if (!sid) return [];
   const j = await ttGet(`/stocks/charts/inter/${encodeURIComponent(sid)}`, `?duration=1d`);
   const today = istDate();
-  return bucketPoints(j?.data?.[0]?.points || [], minutes).filter((c) => c.timestamp.slice(0, 10) === today || minutes >= 1440);
+  return bucketPoints(j?.data?.[0]?.points || [], minutes).filter((c) => c.timestamp.slice(0, 10) === today);
 }
 async function handleIntraday(url, symbol, ctx) {
   const interval = url.searchParams.get("interval") || "30minute";
@@ -205,7 +218,7 @@ function yahooCandles(j) {
   }
   return out;
 }
-async function handleCandles(url, symbol) {
+async function handleCandles(url, symbol, ctx) {
   const range = url.searchParams.get("range") || "6mo";
   const interval = yhInterval(url.searchParams.get("interval") || "1d");
   const today = istDate();
@@ -213,17 +226,18 @@ async function handleCandles(url, symbol) {
   let candles = yahooCandles(j).filter((c) => c.timestamp.slice(0, 10) < today);   // Yahoo = PAST only
   let liveLast = false;
   if (interval === "1d") {
-    // TODAY's daily bar from Groww (real, live during session / settled after) —
-    // never Yahoo for the current day.
-    const g = growwToQuote(symbol, await getJson(GROWW(symbol)));
-    if (g) {
+    // TODAY's daily bar from the live Tickertape session (aggregate the day's
+    // ticks into one OHLC bar) — never Yahoo for the current day.
+    const tb = await ttTodayBars(symbol, 1440, ctx).catch(() => []);
+    const b = tb[tb.length - 1];
+    if (b) {
       const ts = `${today}T03:45:00.000Z`;
-      const o = g.open ?? g.price, h = g.high, l = g.low, c = g.price, v = g.volume;
-      candles.push({ timestamp: ts, open: o, high: h, low: l, close: c, volume: v, oi: 0, 0: ts, 1: o, 2: h, 3: l, 4: c, 5: v });
+      candles.push({ timestamp: ts, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, oi: 0,
+        0: ts, 1: b.open, 2: b.high, 3: b.low, 4: b.close, 5: b.volume });
       liveLast = true;
     }
   }
-  return json({ symbol, interval, range, count: candles.length, liveLastBar: liveLast, candles, pastSource: "yahoo", todaySource: liveLast ? "groww_live" : null });
+  return json({ symbol, interval, range, count: candles.length, liveLastBar: liveLast, candles, pastSource: "yahoo", todaySource: liveLast ? "tickertape_live" : null });
 }
 async function handleHistory(url, symbol, ctx) {
   const rawInt = url.searchParams.get("interval") || "30minute";
@@ -381,9 +395,9 @@ export default {
     const seg = decodeURIComponent(pathname.split("/").pop());
     let resp;
     try {
-      if (pathname === "/api/v1/sb/quotes") resp = await handleQuotes(url);
+      if (pathname === "/api/v1/sb/quotes") resp = await handleQuotes(url, ctx);
       else if (pathname.startsWith("/api/v1/sb/intraday/")) resp = await handleIntraday(url, seg, ctx);
-      else if (pathname.startsWith("/api/v1/sb/candles/")) resp = await handleCandles(url, seg);
+      else if (pathname.startsWith("/api/v1/sb/candles/")) resp = await handleCandles(url, seg, ctx);
       else if (pathname.startsWith("/api/v1/sb/history/")) resp = await handleHistory(url, seg, ctx);
       else if (pathname === "/api/v1/sb/context") resp = await handleContext();
       else if (pathname === "/api/v1/sb/mmi") { const m = await ttGet("/mmi/now"); resp = json(m?.data || m || {}); }
