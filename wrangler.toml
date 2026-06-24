@@ -26,3 +26,24 @@ workers_dev = true
 
 [observability]
 enabled = true
+
+# ── Second CF account (load-split mirror) ────────────────────────────────────
+# Deploy the SAME src/index.js to a SECOND Cloudflare account so edge load is
+# split across two free plans (each = its own 100k req/day quota fronting the one
+# Northflank origin). ONE codebase → zero drift: this env only renames the Worker,
+# everything above (main, compat flags, observability) is inherited.
+#
+# The TARGET ACCOUNT is chosen by the CREDENTIALS you deploy with, NOT by this
+# file. To ship to account #2:
+#   CLOUDFLARE_API_TOKEN=<acct#2 token> CLOUDFLARE_ACCOUNT_ID=<acct#2 id> \
+#     npm run deploy:2
+#   (token = SECRET, never commit. Create at dash.cloudflare.com → My Profile →
+#    API Tokens → "Edit Cloudflare Workers" template, scoped to account #2.
+#    account id is on that account's Workers & Pages overview — not secret.)
+# Result URL: https://bharat-ticker-cf2.<acct#2-subdomain>.workers.dev
+#   → put it in localhost env BHARAT_CLOUDFLARE_URL_2 to arm the 2nd edge.
+[env.cf2]
+name = "bharat-ticker-cf2"
+
+[env.cf2.observability]
+enabled = true

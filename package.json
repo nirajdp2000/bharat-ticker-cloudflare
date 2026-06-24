@@ -7,7 +7,9 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "tail": "wrangler tail"
+    "deploy:2": "wrangler deploy --env cf2",
+    "tail": "wrangler tail",
+    "tail:2": "wrangler tail --env cf2"
   },
   "devDependencies": {
     "wrangler": "^4.103.0"
