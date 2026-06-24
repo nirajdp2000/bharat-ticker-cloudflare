@@ -517,8 +517,10 @@ async function handleResolve(url, ctx) {
 }
 
 // ── router ───────────────────────────────────────────────────────────────────
-export default {
-  async fetch(request, env, ctx) {
+// Extracted so BOTH the HTTP entry (`fetch`) and the cron warm-keeper (`scheduled`)
+// run the identical routing + edge-cache-population path — warming therefore writes
+// the SAME cache key a real request reads, turning that read into a HIT.
+async function route(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
@@ -564,5 +566,36 @@ export default {
       return new Response(body, { status: 200, headers: h });
     }
     return resp;
+}
+
+export default {
+  // HTTP entry — the live /api/v1/sb/* router (also populates the edge cache).
+  fetch: route,
+
+  // ── Cron warm-keeper (FREE-plan Cron Trigger) ──────────────────────────────
+  // Keeps the LONG-TTL edge cache hot for a configured hot-list (env SB_WARM_SYMBOLS,
+  // comma list) so those reads are HITs that skip the upstream scrape entirely. Live
+  // quotes (5s TTL) are deliberately NOT warmed — they are fresh-or-cold by design and
+  // warming them would just re-scrape every cycle. Self-gates to the IST market window
+  // (weekday) so it never burns quota at 3am. Empty SB_WARM_SYMBOLS → no-op.
+  //
+  // FREE-TIER REALITY: 50 subrequests / invocation (fetch AND Cache match/put all
+  // count). route() spends ~5 subreq per candles warm and ~3–8 per fundamentals, so we
+  // warm ONE path-type per tick and cap the list, keeping every run well under 50:
+  //   • candles (range=6mo&interval=1d) on each 2-min tick — its 120s TTL needs the
+  //     frequent refresh; ≤8 symbols × ~5 = ≤40 subreq.
+  //   • fundamentals ALONE on the ~30-min tick (1h TTL needs no more); ≤6 × ~8 = ≤48.
+  async scheduled(event, env, ctx) {
+    const list = (env.SB_WARM_SYMBOLS || "")
+      .split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
+    if (!list.length) return;
+    const ist = nowIST(), dow = ist.getUTCDay(), mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+    if (dow === 0 || dow === 6 || mins < 8 * 60 || mins > 16 * 60 + 30) return;   // off-hours → skip
+    const fundTick = mins % 30 < 2;            // ~every 30 min, alone (1h TTL)
+    const paths = fundTick
+      ? list.slice(0, 6).map((s) => `/api/v1/sb/fundamentals/${encodeURIComponent(s)}`)
+      : list.slice(0, 8).map((s) => `/api/v1/sb/candles/${encodeURIComponent(s)}?range=6mo&interval=1d`);
+    // route() writes the canonical edge-cache entry on each 200 (same key a real read uses).
+    await Promise.allSettled(paths.map((p) => route(new Request("https://edge.warm" + p), env, ctx)));
   },
 };

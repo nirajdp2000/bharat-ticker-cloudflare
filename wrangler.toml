@@ -27,6 +27,18 @@ workers_dev = true
 [observability]
 enabled = true
 
+# ── Cron warm-keeper ─────────────────────────────────────────────────────────
+# Fires the scheduled() handler every 2 min; it self-gates to the IST market window
+# and pre-warms the long-TTL edge cache (candles/fundamentals) for SB_WARM_SYMBOLS so
+# those reads are HITs that skip the upstream scrape. Cron Triggers are free.
+[triggers]
+crons = ["*/2 * * * *"]
+
+# Hot-list to keep warm (comma list, ≤8 effective per the 50-subreq/invocation cap).
+# Override per deploy via the dashboard or by editing here. Empty = warmer is a no-op.
+[vars]
+SB_WARM_SYMBOLS = "RELIANCE,HDFCBANK,ICICIBANK,TCS,INFY,SBIN,BHARTIARTL,ITC"
+
 # ── Second CF account (load-split mirror) ────────────────────────────────────
 # Deploy the SAME src/index.js to a SECOND Cloudflare account so edge load is
 # split across two free plans (each = its own 100k req/day quota fronting the one
@@ -47,3 +59,10 @@ name = "bharat-ticker-cf2"
 
 [env.cf2.observability]
 enabled = true
+
+# Named environments do NOT inherit triggers/vars — repeat them for cf2.
+[env.cf2.triggers]
+crons = ["*/2 * * * *"]
+
+[env.cf2.vars]
+SB_WARM_SYMBOLS = "RELIANCE,HDFCBANK,ICICIBANK,TCS,INFY,SBIN,BHARTIARTL,ITC"
