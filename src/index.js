@@ -450,7 +450,13 @@ async function handleContext() {
 }
 
 // ── fundamentals (screener.in) ───────────────────────────────────────────────
-const RATIO_RE = /<li[^>]*>[\s\S]*?<span[^>]*class="name"[^>]*>\s*([\s\S]*?)\s*<\/span>[\s\S]*?<span[^>]*class="number"[^>]*>\s*([\d,.\-]+)\s*<\/span>/gi;
+// Backtrack-SAFE. The OLD pattern ran a lazy `[\s\S]*?` from EVERY <li> across the
+// full ~500KB page; any <li> without a following name/number pair made that gap
+// expand to end-of-doc on each retry → O(n²) catastrophic backtracking → the Worker
+// blew the 10ms free-tier CPU cap ("Worker exceeded CPU time limit"). Now every
+// quantifier is BOUNDED (no runaway) and the caller scopes it to the few-KB
+// `#top-ratios` block, so the scan domain is tiny instead of the whole document.
+const RATIO_RE = /class="name"[^>]*>\s*([^<]{1,60}?)\s*<\/span>[\s\S]{0,200}?class="number"[^>]*>\s*([\d,.\-]+)\s*<\/span>/gi;
 function lastRowValue(sectionHtml, label) {
   const rows = sectionHtml.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
   for (const row of rows) if (row.toLowerCase().includes(label.toLowerCase())) {
@@ -465,8 +471,13 @@ async function handleFundamentals(symbol) {
     const html = await getText(`https://www.screener.in/company/${encodeURIComponent(v)}/consolidated/`).catch(() => null)
       || await getText(`https://www.screener.in/company/${encodeURIComponent(v)}/`).catch(() => null);
     if (!html || html.length < 5000) continue;
+    // Scope the ratio scan to the `#top-ratios` block (a few KB) instead of the
+    // whole ~500KB page: massive CPU win AND it avoids matching `class="name"`
+    // that appears elsewhere on the page. Bounded fallback slice if not found.
+    const trAt = html.indexOf('id="top-ratios"');
+    const ratioScope = trAt > -1 ? html.slice(trAt, trAt + 6000) : html.slice(0, 30000);
     const ratios = {};
-    for (const m of html.matchAll(RATIO_RE)) ratios[m[1].replace(/\s+/g, " ").trim().toLowerCase()] = num(m[2]);
+    for (const m of ratioScope.matchAll(RATIO_RE)) ratios[m[1].replace(/\s+/g, " ").trim().toLowerCase()] = num(m[2]);
     const gv = (...keys) => { for (const k of keys) for (const rk in ratios) if (rk.includes(k.toLowerCase())) return ratios[rk]; return null; };
     const price = gv("current price"), bv = gv("book value");
     const pe = gv("stock p/e", "p/e");
